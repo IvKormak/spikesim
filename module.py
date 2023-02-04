@@ -6,7 +6,7 @@ from tqdm import trange
 from dataclasses import dataclass
 import csv
 
-class Network:
+class SpikeNetworkSim:
     def __init__(self, inputs_l = 1, labels = None,dt = 1):
         
         if labels is None:
@@ -38,6 +38,7 @@ class Network:
         self.wmin = []
         self.wmax = []
         self.learning = []
+        self.wta = []
         
     def new_layer(self, width, weights=None, labels=None, *, 
                     tau_inhibitory = 3, 
@@ -49,7 +50,8 @@ class Network:
                     adec = -15, 
                     wmax = 255,
                     wmin = 1,
-                    learning = True
+                    learning = True,
+                    wta = False
                  ):
         #print(f"{inputs_l=},{labels=},{dt=},{tau_inhibitory=},{tau_refractory=},{tau_leak=},{tau_ltp=},{thres=},{ainc=},{adec=},{wmax=},{wmin=}")
         self.tau_refractory.append(tau_refractory)
@@ -62,6 +64,7 @@ class Network:
         self.wmin.append(wmin)
         self.wmax.append(wmax)
         self.learning.append(learning)
+        self.wta.append(wta)
         
         nnodes = []
         nweights = []
@@ -69,16 +72,15 @@ class Network:
         layer = self.nodes["layer"].max()+1
         
         if layer == 0: #первый слой
-            inputs = np.array(self.nodes.loc[self.nodes["priority"]==0].index.tolist())
+            inputs = np.array(self.nodes.query("priority==0").index.tolist())
         else: #нужно пропустить потенцирующие ноды
-            inputs = np.array(self.nodes.loc[self.nodes["priority"]==priority-2].index.tolist())
-        
-            
-        if weights is None:
-            weights = np.array([np.random.randint(self.wmin, self.wmax, inputs.shape[0]) for _ in range(width)])
-            
-        if weights.shape != (width, inputs.shape[0]):
-            raise Exception(f"Требуется массив {(width, inputs.shape[0])}, получено {weights.shape}")
+            inputs = np.array(self.nodes.query("priority==@priority-2").index.tolist())
+        if weights is None or weights.shape[0]==0:
+            weights = np.random.randint(wmin, wmax, (width, inputs.shape[0]))
+        elif weights.shape[1] > inputs.shape[0] or weights.shape[0] > width:
+            raise Exception(f"Требуется массив (1...{width},{inputs.shape[0]}), получено {weights.shape}")
+        elif weights.shape[0] < width:
+            weights = np.concatenate((weights, np.random.randint(wmin, wmax, (width-weights.shape[0], inputs.shape[0]))))
             
         node_id = self.nodes.index.size
         presynaptic_id = node_id+inputs.shape[0]
@@ -149,8 +151,8 @@ class Network:
     
     def make_recurrent(self):
         max_priority = self.nodes["priority"].max()
-        last_layer_output = np.array(self.nodes.loc[self.nodes["priority"]==max_priority-1].index.tolist())
-        first_layer_summators = np.array(self.nodes.loc[self.nodes["priority"]==2].index.tolist())
+        last_layer_output = np.array(self.nodes.query("priority==@max_priority-1").index.tolist())
+        first_layer_summators = np.array(self.nodes.query("priority==2").index.tolist())
         nnodes = [
             {
                 "type": "recurrent",
@@ -171,13 +173,12 @@ class Network:
         self.weights = pd.DataFrame(nweights)
     
     def stepwise_generator(self, data):
-        vals = pd.Series(np.zeros(data.shape[1]))
-        for t in data.index:
-            vals_z = vals
-            vals = data.iloc[t].copy()
+        vals_z = np.zeros(data.shape[1])
+        nodes_sorted = self.nodes.sort_values("priority")
+        nodes_sorted, index_sorted = nodes_sorted.values, nodes_sorted.index
+        for t, vals in enumerate(data):
             layer = None
-            for node in self.nodes.sort_values("priority").index.tolist():
-                node_type, _, listen, cast, _layer = self.nodes.loc[node, :]
+            for (node_type, _, listen, cast, _layer), node in zip(nodes_sorted, index_sorted):
                 if node_type == "input":
                     continue
                 if _layer != layer:
@@ -192,7 +193,8 @@ class Network:
                         adec,
                         wmin,
                         wmax,
-                        learning
+                        learning,
+                        wta
                     ) = (
                         self.leak[layer],
                         self.thres[layer],
@@ -203,34 +205,38 @@ class Network:
                         self.adec[layer],
                         self.wmin[layer],
                         self.wmax[layer],
-                        self.learning[layer]
+                        self.learning[layer],
+                        self.wta[layer]
                     )
                     
-                n_val = vals.at[node]
+                n_val = vals[node]
                 if node_type == "recurrent":
-                    n_val = vals.at[listen]
+                    n_val = vals[listen]
                 if node_type == "ltp":
-                    if vals.at[listen]:
+                    if vals[listen]:
                         n_val = 0
                     else:
-                        n_val += self.dt
+                        n_val = vals_z[node]+1
                 elif node_type == "presynaptic":
                     if self.weights.at[node, "inhibited"] < t:
-                        n_val = (vals[listen].values*self.weights.at[node, "weights"]).sum()+vals_z[node]*leak
+                        n_val = (vals[listen]*self.weights.at[node, "weights"]).sum()+vals_z[node]*leak
                 elif node_type == "postsynaptic":
-                    n_val = int(vals.at[listen]>thres)
+                    n_val = int(vals[listen]>thres)
                     if n_val:
                         self.weights.at[listen, "inhibited"] = t+tau_refractory
                         for b in cast:
+                            if wta:
+                                vals[b] = 0
                             self.weights.at[b, "inhibited"] = max(t+tau_inhibitory, self.weights.at[b, "inhibited"]+tau_inhibitory)
                 elif node_type == "potentiating":
-                    if vals.at[node-1] and learning:
-                        nw = self.weights.at[cast, "weights"] + np.where(vals[listen]>tau_ltp, ainc, adec)
+                    if vals[node-1] and learning:
+                        nw = self.weights.at[cast, "weights"] + np.where(vals[listen]<tau_ltp, ainc, adec)
                         nw = np.where(nw>wmax, wmax, nw)
                         self.weights.at[cast, "weights"] = np.where(nw<wmin, wmin, nw)
 
-                vals.at[node] = n_val
-            yield vals
+                vals[node] = n_val
+            vals_z = vals
+            yield dict(zip(self.nodes.index, vals))
                 
     def feed_csv(self, data_csv, out_csv, data_timestep=1):
         self.weights["inhibited"].values[:] = 0
@@ -251,14 +257,31 @@ class Network:
     
     def feed_raw(self, data_raw, out_csv):
         self.weights["inhibited"].values[:] = 0
-        data = pd.DataFrame(data_raw, columns=self.nodes.index).fillna(0)
+        data = pd.DataFrame(data_raw, columns=self.nodes.index).fillna(0).values
         s = self.stepwise_generator(data)
-        out = [u.to_dict() for u in s]
+        out = [u for u in s]
         self.values = pd.DataFrame(out)
         with open(out_csv, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=self.values.columns)
             writer.writeheader()
             for row in out:
                 writer.writerow(row)
-        return pd.DataFrame(out)
+        return pd.DataFrame(out)        
+    
+    def error(self, answers_vector, pos_weight=1, neg_weight=1):
+        if not isinstance(answers_vector, np.ndarray):
+            answers_vector = np.array(answers_vector)
+        output_nodes = self.nodes.query("type == 'postsynaptic'").index
+        outputs = self.values.loc[:, output_nodes].values
+        categories = list(set(answers_vector))
+        score = []
+        for category in categories:
+            answers_cat_pos = np.where(answers_vector == category, 1, 0)
+            answers_cat_neg = np.where(answers_vector != category, 1, 0)
+            sp = np.einsum("i,ij->j", answers_cat_pos, outputs)*pos_weight
+            sn = np.einsum("i,ij->j", answers_cat_neg, outputs)*neg_weight
+            score.append(((answers_cat_pos.sum()-sp)+sn/(len(categories)-1))/answers_cat_pos.sum())
+        return pd.DataFrame(score, columns=output_nodes, index=categories)
+            
+            
     
