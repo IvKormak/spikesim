@@ -28,44 +28,48 @@ class SpikeNetworkSim:
         self.weights = pd.DataFrame(columns=["weights", "inhibited"])
         self.dt = dt
         
-        self.tau_refractory = []
-        self.tau_inhibitory = []
-        self.tau_ltp = []
-        self.leak = []
-        self.thres = []
-        self.ainc = []
-        self.adec = []
-        self.wmin = []
-        self.wmax = []
-        self.learning = []
-        self.wta = []
+        self.layer_params = {
+            "tau_refractory": [],
+            "tau_inhibitory": [],
+            "tau_ltp": [],
+            "tau_leak": [],
+            "thres": [],
+            "ainc": [],
+            "adec": [],
+            "wmin": [],
+            "wmax": [],
+            "learning": [],
+            "wta": [],
+            "desensibilization": []
+        }
         
-    def new_layer(self, width, weights=None, labels=None, *, 
-                    tau_inhibitory = 3, 
-                    tau_refractory = 5, 
-                    tau_leak = 10, 
-                    tau_ltp = 5, 
-                    thres = 200,
-                    ainc = 30, 
-                    adec = -15, 
-                    wmax = 255,
-                    wmin = 1,
-                    learning = True,
-                    wta = False
-                 ):
+        self.defaults = {
+            "tau_inhibitory": 3, 
+            "tau_refractory": 5, 
+            "tau_leak": 10, 
+            "tau_ltp": 5, 
+            "thres": 200,
+            "ainc": 30, 
+            "adec": -15, 
+            "wmax": 255,
+            "wmin": 1,
+            "learning": True,
+            "wta": False,
+            "desensibilization": None
+        }
+        
+    def new_layer(self, width, weights=None, labels=None, **layer_params):
         #print(f"{inputs_l=},{labels=},{dt=},{tau_inhibitory=},{tau_refractory=},{tau_leak=},{tau_ltp=},{thres=},{ainc=},{adec=},{wmax=},{wmin=}")
-        self.tau_refractory.append(tau_refractory)
-        self.tau_inhibitory.append(tau_inhibitory)
-        self.tau_ltp.append(tau_ltp)
-        self.leak.append(np.exp(-self.dt/tau_leak))
-        self.thres.append(thres)
-        self.ainc.append(ainc)
-        self.adec.append(adec)
-        self.wmin.append(wmin)
-        self.wmax.append(wmax)
-        self.learning.append(learning)
-        self.wta.append(wta)
-        
+        for param in layer_params.keys():
+            if param in layer_params:
+                self.layer_params[param].append(layer_params[param])
+            else:
+                raise Exception(f"Parameter {param} doesn't exist")
+        for dparam in self.defaults.keys():
+            if dparam not in layer_params:
+                self.layer_params[dparam].append(self.defaults[dparam])
+                
+                
         nnodes = []
         nweights = []
         priority = self.nodes["priority"].max()+1
@@ -76,11 +80,11 @@ class SpikeNetworkSim:
         else: #нужно пропустить потенцирующие ноды
             inputs = np.array(self.nodes.query("priority==@priority-2").index.tolist())
         if weights is None or weights.shape[0]==0:
-            weights = np.random.randint(wmin, wmax, (width, inputs.shape[0]))
+            weights = np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width, inputs.shape[0]))
         elif weights.shape[1] > inputs.shape[0] or weights.shape[0] > width:
             raise Exception(f"Требуется массив (1...{width},{inputs.shape[0]}), получено {weights.shape}")
         elif weights.shape[0] < width:
-            weights = np.concatenate((weights, np.random.randint(wmin, wmax, (width-weights.shape[0], inputs.shape[0]))))
+            weights = np.concatenate((weights, np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width-weights.shape[0], inputs.shape[0]))))
             
         node_id = self.nodes.index.size
         presynaptic_id = node_id+inputs.shape[0]
@@ -183,31 +187,8 @@ class SpikeNetworkSim:
                     continue
                 if _layer != layer:
                     layer = _layer
-                    (
-                        leak,
-                        thres,
-                        tau_refractory, 
-                        tau_inhibitory,
-                        tau_ltp,
-                        ainc, 
-                        adec,
-                        wmin,
-                        wmax,
-                        learning,
-                        wta
-                    ) = (
-                        self.leak[layer],
-                        self.thres[layer],
-                        self.tau_refractory[layer], 
-                        self.tau_inhibitory[layer],
-                        self.tau_ltp[layer],
-                        self.ainc[layer], 
-                        self.adec[layer],
-                        self.wmin[layer],
-                        self.wmax[layer],
-                        self.learning[layer],
-                        self.wta[layer]
-                    )
+                    params = {k: self.layer_params[k][layer] for k in self.layer_params.keys()}
+                    params["leak"] = np.exp(-self.dt/params["tau_leak"])
                     
                 n_val = vals[node]
                 if node_type == "recurrent":
@@ -219,20 +200,20 @@ class SpikeNetworkSim:
                         n_val = vals_z[node]+1
                 elif node_type == "presynaptic":
                     if self.weights.at[node, "inhibited"] < t:
-                        n_val = (vals[listen]*self.weights.at[node, "weights"]).sum()+vals_z[node]*leak
+                        n_val = (vals[listen]*self.weights.at[node, "weights"]).sum()+vals_z[node]*params["leak"]
                 elif node_type == "postsynaptic":
-                    n_val = int(vals[listen]>thres)
+                    n_val = int(vals[listen]>params["thres"])
                     if n_val:
-                        self.weights.at[listen, "inhibited"] = t+tau_refractory
+                        self.weights.at[listen, "inhibited"] = t+params["tau_refractory"]
                         for b in cast:
-                            if wta:
+                            if params["wta"]:
                                 vals[b] = 0
-                            self.weights.at[b, "inhibited"] = max(t+tau_inhibitory, self.weights.at[b, "inhibited"]+tau_inhibitory)
+                            self.weights.at[b, "inhibited"] = max(t+params["tau_inhibitory"], self.weights.at[b, "inhibited"]+params["tau_inhibitory"])
                 elif node_type == "potentiating":
-                    if vals[node-1] and learning:
-                        nw = self.weights.at[cast, "weights"] + np.where(vals[listen]<tau_ltp, ainc, adec)
-                        nw = np.where(nw>wmax, wmax, nw)
-                        self.weights.at[cast, "weights"] = np.where(nw<wmin, wmin, nw)
+                    if vals[node-1] and params["learning"]:
+                        nw = self.weights.at[cast, "weights"] + np.where(vals[listen]<params["tau_ltp"], params["ainc"], params["adec"])
+                        nw = np.where(nw>params["wmax"], params["wmax"], nw)
+                        self.weights.at[cast, "weights"] = np.where(nw<params["wmin"], params["wmin"], nw)
 
                 vals[node] = n_val
             vals_z = vals
