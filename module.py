@@ -24,8 +24,9 @@ class SpikeNetworkSim:
                 "layer": -1
             } for _ in range(inputs_l)]
         
-        self.nodes = pd.DataFrame(data=input_nodes, columns=["type", "priority", "listening", "broadcasting", "layer"])
+        self.nodes = pd.DataFrame(data=input_nodes, columns=["type", "priority", "listening", "broadcasting"])
         self.weights = pd.DataFrame(columns=["weights", "inhibited"])
+        self.layers = pd.DataFrame(columns=["layer"])
         self.dt = dt
         
         self.tau_refractory = []
@@ -68,6 +69,7 @@ class SpikeNetworkSim:
         
         nnodes = []
         nweights = []
+        nlayers = []
         priority = self.nodes["priority"].max()+1
         layer = self.nodes["layer"].max()+1
         
@@ -145,14 +147,16 @@ class SpikeNetworkSim:
             
             presynaptic_id += 3
             postsynaptic_id += 3
-            
+        nlayers = [{"layer": layer} for _ in range(node_id, presynaptic_id)]
         self.nodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True)
         self.weights = pd.concat((self.weights, pd.DataFrame(nweights).set_index("node", drop=True)))
+        self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
     
     def make_recurrent(self):
         max_priority = self.nodes["priority"].max()
         last_layer_output = np.array(self.nodes.query("priority==@max_priority-1").index.tolist())
         first_layer_summators = np.array(self.nodes.query("priority==2").index.tolist())
+        nlayer = [{"layer": 0} for _ in last_layer_output]
         nnodes = [
             {
                 "type": "recurrent",
@@ -171,11 +175,13 @@ class SpikeNetworkSim:
             nnodes["listening"][s+2] = np.concatenate((nnodes["listening"][s+2], recurrent_presynaptic_indexes))
         self.nodes = pd.DataFrame(nnodes)
         self.weights = pd.DataFrame(nweights)
+        self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
     
     def stepwise_generator(self, data):
         vals_z = np.zeros(data.shape[1])
         nodes_sorted = self.nodes.sort_values("priority")
         nodes_sorted, index_sorted = nodes_sorted.values, nodes_sorted.index
+        
         for t, vals in enumerate(data):
             layer = None
             for (node_type, _, listen, cast, _layer), node in zip(nodes_sorted, index_sorted):
@@ -255,17 +261,18 @@ class SpikeNetworkSim:
                 writer.writerow(row)
         return pd.DataFrame(out)
     
-    def feed_raw(self, data_raw, out_csv):
+    def feed_raw(self, data_raw, out_csv=None):
         self.weights["inhibited"].values[:] = 0
         data = pd.DataFrame(data_raw, columns=self.nodes.index).fillna(0).values
         s = self.stepwise_generator(data)
         out = [u for u in s]
         self.values = pd.DataFrame(out)
-        with open(out_csv, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=self.values.columns)
-            writer.writeheader()
-            for row in out:
-                writer.writerow(row)
+        if not out_csv is None:
+            with open(out_csv, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.values.columns)
+                writer.writeheader()
+                for row in out:
+                    writer.writerow(row)
         return pd.DataFrame(out)        
     
     def error(self, answers_vector, pos_weight=1, neg_weight=1):
