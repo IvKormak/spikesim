@@ -65,7 +65,7 @@ class SpikeNetworkSim:
             "tempotron": self.ttron_process
         }
         
-    def new_dendritic_layer(self, dendrite_connections, dendrite_weights, labels=None, **layer_params):
+    def new_dendritic_layer(self, dendrite_connections, dendrite_weights=None, labels=None, **layer_params):
         """
         connections: описание каждого дендрита, список словарей. Каждый ключ - индекс входа из input_list, значение - задержка сигнала в дельтах
         """
@@ -82,6 +82,9 @@ class SpikeNetworkSim:
         last_priority = self.nodes.priority.max()
         ltp_priority = last_priority+2  
         layer = self.layers.layer.max()+1
+        
+        if dendrite_weights is None:
+            dendrite_weights = [{k: [np.random.randint(1, 256) for _ in c] for k, c in connection.items()} for connection in dendrite_connections]
         
         delay_map = {}
         delay_ltp_nodes = {}
@@ -187,10 +190,11 @@ class SpikeNetworkSim:
                     "priority": potentiating_priority}
             )
             
-        if labels is None:
-            labels = postsynaptic_range
-        self.labels_dict.update(dict(zip(postsynaptic_range, labels)))
+        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
+        if labels is not None:
+            nlabels[postsynaptic_range-first_node-1] = labels
             
+        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes), dtype="object"), nlabels)))
         nlayers = [{"layer": layer} for _ in range(self.nodes.index.size, potentiating_id+1)]
         self.nodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True)
         self.weights = pd.concat((self.weights, pd.DataFrame(nweights).set_index("node", drop=True)))
@@ -247,9 +251,10 @@ class SpikeNetworkSim:
             )
                 
         
-        if labels is None:
-            labels = layer_postsynaptic_range
-        self.labels_dict.update(dict(zip(layer_postsynaptic_range, labels)))
+        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
+        if labels is not None:
+            nlabels[postsynaptic_rangefirst_node-1] = labels
+        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes)), nlabels)))
         
         for w in weights:
             nnodes.append(
@@ -337,7 +342,8 @@ class SpikeNetworkSim:
                     layer = _layer
                     params = {k: layer_params[k][layer] for k in layer_params.keys()}
                     params["leak"] = np.exp(-self.dt/params["tau_leak"])
-                vals = self.processors[params["layer_type"]](node_type, _, listen, cast, status, vals, vals_z, params, node, t)       
+                    processor = self.processors[params["layer_type"]]
+                vals = processor(node_type, _, listen, cast, status, vals, vals_z, params, node, t)       
                         
             vals_z = vals
             yield dict(zip(self.nodes.index, vals))
@@ -347,27 +353,30 @@ class SpikeNetworkSim:
     
     def process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
         n_val = vals[node]
-        if node_type == "ltp":
-            if vals[listen]:
-                n_val = 1
-            else:
-                n_val = vals_z[node]+1
-        elif node_type == "presynaptic":
-            if status["inhibited"][node] < t:
-                n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
-        elif node_type == "postsynaptic":
-            n_val = int(vals[listen]>params["thres"])
-            if n_val:
-                status["inhibited"][listen] = t+params["tau_refractory"]
-                for b in cast:
-                    if params["wta"]:
-                        vals[b] = 0
-                    status["inhibited"][b] = max(t+params["tau_inhibitory"], status["inhibited"][b]+params["tau_inhibitory"])
-        elif node_type == "potentiating":
-            if vals[node-1] and params["learning"]:
-                nw = status["weights"][cast] + np.where(vals[listen]<params["tau_ltp"], params["ainc"], params["adec"])
-                nw = np.where(nw>params["wmax"], params["wmax"], nw)
-                status["weights"][cast] = np.where(nw<params["wmin"], params["wmin"], nw)
+        match node_type:
+            case "ltp":
+                if vals[listen]:
+                    n_val = 1
+                else:
+                    n_val = vals_z[node]+1
+            case "buffer":
+                n_val = vals_z[listen]
+            case "presynaptic":
+                if status["inhibited"][node] < t:
+                    n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
+            case "postsynaptic":
+                n_val = int(vals[listen]>params["thres"])
+                if n_val:
+                    status["inhibited"][listen] = t+params["tau_refractory"]
+                    for b in cast:
+                        if params["wta"]:
+                            vals[b] = 0
+                        status["inhibited"][b] = max(t+params["tau_inhibitory"], status["inhibited"][b]+params["tau_inhibitory"])
+            case "potentiating":
+                if vals[node-1] and params["learning"]:
+                    nw = status["weights"][cast] + np.where(vals[listen]<params["tau_ltp"], params["ainc"], params["adec"])
+                    nw = np.where(nw>params["wmax"], params["wmax"], nw)
+                    status["weights"][cast] = np.where(nw<params["wmin"], params["wmin"], nw)
         vals[node] = n_val
         return vals
     
