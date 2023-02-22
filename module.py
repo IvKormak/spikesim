@@ -84,7 +84,7 @@ class SpikeNetworkSim:
         layer = self.layers.layer.max()+1
         
         if dendrite_weights is None:
-            dendrite_weights = [{k: [np.random.randint(1, 256) for _ in c] for k, c in connection.items()} for connection in dendrite_connections]
+            dendrite_weights = [{k: np.random.randint(1, 256, len(c)) for k, c in connection.items()} for connection in dendrite_connections]
         
         delay_map = {}
         delay_ltp_nodes = {}
@@ -129,7 +129,7 @@ class SpikeNetworkSim:
                         }
                     )
                     delay_map[synaptic_via][1] = first_node+len(nnodes)
-            weights = [dweights[s][d] for s,d in dendrite_inputs]
+            weights = np.array([dweights[s][d] for s,d in dendrite_inputs])
             weights_map.append(weights)
             dendrite_inputs = [delay_map[s][d] for s,d in dendrite_inputs]
             dendrite_inputs_map.append(dendrite_inputs)
@@ -393,6 +393,7 @@ class SpikeNetworkSim:
             n_val = int((1-2*(status["inhibited"][listen] > t))*vals[listen]>params["thres"])
             if n_val != 0:
                 vals[listen] = -1*params["tau_refractory"]/params["tau_ltp"]*params["thres"]
+                vals[listen] *= np.sqrt(np.sum((status["weights"][listen]/(params["wmax"]-params["wmin"])-0.5)**2)/6)
                 if n_val == 1:
                     for b in cast:
                         if params["wta"]:
