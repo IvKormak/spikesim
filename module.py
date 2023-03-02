@@ -62,7 +62,7 @@ class SpikeNetworkSim:
         
         self.processors = {
             "default": self.process,
-            "tempotron": self.ttron_process
+            "mod_stdp": self.mod_stdp_process
         }
         
     def new_dendritic_layer(self, dendrite_connections, dendrite_weights=None, labels=None, **layer_params):
@@ -343,7 +343,7 @@ class SpikeNetworkSim:
                     params = {k: layer_params[k][layer] for k in layer_params.keys()}
                     params["leak"] = np.exp(-self.dt/params["tau_leak"])
                     processor = self.processors[params["layer_type"]]
-                vals = processor(node_type, _, listen, cast, status, vals, vals_z, params, node, t)       
+                vals, status = processor(node_type, _, listen, cast, status, vals, vals_z, params, node, t)       
                         
             vals_z = vals
             yield dict(zip(self.nodes.index, vals))
@@ -378,63 +378,46 @@ class SpikeNetworkSim:
                     nw = np.where(nw>params["wmax"], params["wmax"], nw)
                     status["weights"][cast] = np.where(nw<params["wmin"], params["wmin"], nw)
         vals[node] = n_val
-        return vals
+        return vals, status
     
-    def ttron_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
+    def mod_stdp_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
+        def dw(target_node, clue, d):
+            nw = status["weights"][target_node] + np.where(clue, d, 0)
+            nw = np.where(nw<params["wmin"], params["wmin"], nw)
+            status["weights"][target_node] = np.where(nw>params["wmax"], params["wmax"], nw)
         n_val = vals[node]
-        if node_type == "ltp":
-            if vals[listen]:
-                n_val = 1
-            else:
-                n_val = vals_z[node]+1
-        elif node_type == "presynaptic":
-            n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
-        elif node_type == "postsynaptic":
-            n_val = int((1-2*(status["inhibited"][listen] > t))*vals[listen]>params["thres"])
-            if n_val != 0:
-                vals[listen] = -1*params["tau_refractory"]/params["tau_ltp"]*params["thres"]
-                vals[listen] *= np.sqrt(np.sum((status["weights"][listen]/(params["wmax"]-params["wmin"])-0.5)**2)/6)
-                if n_val == 1:
+        match node_type:
+            case "ltp":
+                if vals[listen]:
+                    n_val = 1
+                else:
+                    n_val = vals_z[node]+1
+            case "buffer":
+                n_val = vals_z[listen]
+            case "presynaptic":
+                if status["inhibited"][node] < t:
+                    n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
+            case "postsynaptic":
+                n_val = int(vals[listen]>params["thres"])
+                if n_val:
+                    status["inhibited"][listen] = t+params["tau_refractory"]
                     for b in cast:
+                        dw(b, vals[self.nodes.at[b,'listening']]<params["tau_ltp"], params["adec"]) 
+                        print(0)
                         if params["wta"]:
                             vals[b] = 0
                         status["inhibited"][b] = max(t+params["tau_inhibitory"], status["inhibited"][b]+params["tau_inhibitory"])
-        elif node_type == "potentiating":
-            if vals[node-1] != 0 and params["learning"]:
-                dw = (params["ainc"] if vals[node-1] > 0 else params["adec"])*(1-np.exp(-params["tau_ltp"]/vals[listen]))
-                nw = status["weights"][cast] + dw
-                nw = np.where(nw>params["wmax"], params["wmax"], nw)
-                status["weights"][cast] = np.where(nw<params["wmin"], params["wmin"], nw)
+            case "potentiating":
+                if vals[node-1] and params["learning"]:
+                    dw(cast, vals[listen]<params["tau_ltp"], params["ainc"])
+                    print(1)
         vals[node] = n_val
-        return vals
+        return vals, status
     
-    def dendritic_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
+    def ttron_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
         n_val = vals[node]
-        if node_type == "buffer":
-            n_val = vals[listen]
-        if node_type == "ltp":
-            if vals[listen]:
-                n_val = 1
-            else:
-                n_val = vals_z[node]+1
-        elif node_type == "presynaptic":
-            if status["inhibited"][node] < t:
-                n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
-        elif node_type == "postsynaptic":
-            n_val = int(vals[listen]>params["thres"])
-            if n_val:
-                status["inhibited"][listen] = t+params["tau_refractory"]
-                for b in cast:
-                    if params["wta"]:
-                        vals[b] = 0
-                    status["inhibited"][b] = max(t+params["tau_inhibitory"], status["inhibited"][b]+params["tau_inhibitory"])
-        elif node_type == "potentiating":
-            if vals[node-1] and params["learning"]:
-                nw = status["weights"][cast] + np.where(vals[listen]<params["tau_ltp"], params["ainc"], params["adec"])
-                nw = np.where(nw>params["wmax"], params["wmax"], nw)
-                status["weights"][cast] = np.where(nw<params["wmin"], params["wmin"], nw)
-        vals[node] = n_val
-        return vals
+        ...
+        return vals, status
     
     def feed_raw(self, data_raw, out_csv=None):
         self.weights["inhibited"].values[:] = 0
