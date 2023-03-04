@@ -367,6 +367,7 @@ class SpikeNetworkSim:
             case "postsynaptic":
                 n_val = int(vals[listen]>params["thres"])
                 if n_val:
+                    vals[listen] = 0
                     status["inhibited"][listen] = t+params["tau_refractory"]
                     for b in cast:
                         if params["wta"]:
@@ -380,43 +381,167 @@ class SpikeNetworkSim:
         vals[node] = n_val
         return vals, status
     
-    def mod_stdp_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
-        def dw(target_node, clue, d):
-            nw = status["weights"][target_node] + np.where(clue, d, 0)
-            nw = np.where(nw<params["wmin"], params["wmin"], nw)
-            status["weights"][target_node] = np.where(nw>params["wmax"], params["wmax"], nw)
+    def ttron_layer(self, width, weights=None, labels=None, passed_inputs=None, **layer_params):
+        #print(f"{inputs_l=},{labels=},{dt=},{tau_inhibitory=},{tau_refractory=},{tau_leak=},{tau_ltp=},{thres=},{ainc=},{adec=},{wmax=},{wmin=}")
+        for param in layer_params.keys():
+            if param in layer_params:
+                self.layer_params[param].append(layer_params[param])
+            else:
+                raise Exception(f"Parameter {param} doesn't exist")
+        for dparam in self.defaults.keys():
+            if dparam not in layer_params:
+                self.layer_params[dparam].append(self.defaults[dparam])
+                
+                
+        nnodes = []
+        nweights = []
+        nlayers = []
+        priority = self.nodes["priority"].max()+1
+        layer = self.layers["layer"].max()+1
+        
+        if layer == 0: #первый слой
+            inputs = np.array(self.nodes.query("priority==0").index.tolist())
+        else: #нужно пропустить потенцирующие ноды
+            inputs = np.array(self.nodes.query("priority==@priority-2").index.tolist())
+        if passed_inputs is not None:
+            inputs = np.concatenate((inputs, passed_inputs))
+        if weights is None or weights.shape[0]==0:
+            weights = np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width, inputs.shape[0]))
+        elif weights.shape[1] > inputs.shape[0] or weights.shape[0] > width:
+            raise Exception(f"Требуется массив (1...{width},{inputs.shape[0]}), получено {weights.shape}")
+        elif weights.shape[0] < width:
+            weights = np.concatenate((weights, np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width-weights.shape[0], inputs.shape[0]))))
+            
+        node_id = self.nodes.index.size
+        presynaptic_id = node_id+inputs.shape[0]
+        postsynaptic_id = presynaptic_id+1
+        potentiating_id = postsynaptic_id+1
+        
+        layer_ltp_range = np.arange(node_id, node_id+inputs.shape[0])
+        layer_presynaptic_range = np.arange(width)*(5)+presynaptic_id
+        layer_postsynaptic_range = np.arange(width)*(5)+postsynaptic_id
+        layer_potentiating_range = np.arange(width)*(5)+potentiating_id
+        
+        for i in inputs:
+            nnodes.append(
+                {
+                    "type": "ltp",
+                    "listening": i,
+                    "broadcasting": None,
+                    "priority": priority
+                }
+            )
+                
+        
+        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
+        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes)), nlabels)))
+        
+        for w in weights:
+            nnodes.append(
+                {
+                    "type": "presynaptic",
+                    "listening": inputs,
+                    "broadcasting": postsynaptic_id,
+                    "priority": priority+1
+                }
+            )
+            nweights.append(
+                {
+                    "node": presynaptic_id,
+                    "weights": w,
+                    "inhibited": -1
+                }
+            )
+            nnodes.append(
+                {
+                    "type": "max_tracker",
+                    "listening": presynaptic_id,
+                    "broadcasting": None,
+                    "priority": priority+2
+                }
+            )
+            
+            nnodes.append(
+                {
+                    "type": "postsynaptic",
+                    "listening": presynaptic_id,
+                    "broadcasting": layer_presynaptic_range[layer_presynaptic_range != presynaptic_id],
+                    "priority": priority+3
+                }
+            )
+            nnodes.append(
+                {
+                    "type": "ltp",
+                    "listening": postsynaptic_id,
+                    "broadcasting": None,
+                    "priority": priority+4
+                }
+            )
+            nnodes.append(
+                {
+                    "type": "potentiating",
+                    "listening": layer_ltp_range,
+                    "broadcasting": presynaptic_id,
+                    "priority": priority+5
+                }
+            )
+            
+            presynaptic_id += 4
+            postsynaptic_id += 4
+        for p in layer_potentiating_range:
+            
+            nnodes.append(
+                {
+                    "type": "teacher",
+                    "listening": None,
+                    "broadcasting": None,
+                    "priority": priority
+                }
+            )
+        nlayers = [{"layer": layer} for _ in range(node_id, presynaptic_id)]
+        self.nodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True)
+        self.weights = pd.concat((self.weights, pd.DataFrame(nweights).set_index("node", drop=True)))
+        self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
+    
+    def ttron_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
+        
+        def change_weights(target_node, delays, time_offset, by):
+            #не учитывать слишком новые импульсы, пришедшие после пика пресинаптического потенциала
+            contrib_coeff = np.nan_to_num(np.exp(-np.where(delays<time_offset, np.nan, delays-time_offset)/params["tau_ltp"]), nan=0) 
+            dw = status["weights"][target_node]*contrib_coeff*by
+            dw = np.where(dw>params["wmax"], params["wmax"], nw)
+            status["weights"][target_node] += np.where(dw<params["wmin"], params["wmin"], dw)
+            
         n_val = vals[node]
         match node_type:
             case "ltp":
-                if vals[listen]:
-                    n_val = 1
-                else:
-                    n_val = vals_z[node]+1
+                if n_val:
+                    if vals[listen]:
+                        n_val = 1
+                    else:
+                        n_val = vals_z[node]+1
+            case "max_tracker":
+                if vals[listen] > n_val:
+                    n_val = vals[listen]
+                    vals[cast] = 1
             case "buffer":
                 n_val = vals_z[listen]
             case "presynaptic":
-                if status["inhibited"][node] < t:
-                    n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
+                n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
             case "postsynaptic":
                 n_val = int(vals[listen]>params["thres"])
                 if n_val:
-                    status["inhibited"][listen] = t+params["tau_refractory"]
-                    for b in cast:
-                        dw(b, vals[self.nodes.at[b,'listening']]<params["tau_ltp"], params["adec"]) 
-                        print(0)
-                        if params["wta"]:
-                            vals[b] = 0
-                        status["inhibited"][b] = max(t+params["tau_inhibitory"], status["inhibited"][b]+params["tau_inhibitory"])
+                    vals[listen] = 0
             case "potentiating":
-                if vals[node-1] and params["learning"]:
-                    dw(cast, vals[listen]<params["tau_ltp"], params["ainc"])
-                    print(1)
-        vals[node] = n_val
-        return vals, status
-    
-    def ttron_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
-        n_val = vals[node]
-        ...
+                postsynaptic_timer = vals[listen[0]]
+                teacher = vals[listen[1]]
+                max_tracker = vals[listen[2]]
+                if teacher:
+                    vals[listen[0]] = False #отключаем таймер ожидания импульса от учителя
+                    change_weights(cast, vals[listen], max_tracker, params["ainc"])
+                if postsynaptic_timer > params["tau_ltp"]:
+                    change_weights(cast, vals[listen], max_tracker, params["adec"])
+            
         return vals, status
     
     def feed_raw(self, data_raw, out_csv=None):
