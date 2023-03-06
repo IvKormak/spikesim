@@ -62,7 +62,7 @@ class SpikeNetworkSim:
         
         self.processors = {
             "default": self.process,
-            "mod_stdp": self.mod_stdp_process
+            "ttron": self.ttron_process
         }
         
     def new_dendritic_layer(self, dendrite_connections, dendrite_weights=None, labels=None, **layer_params):
@@ -381,8 +381,10 @@ class SpikeNetworkSim:
         vals[node] = n_val
         return vals, status
     
-    def ttron_layer(self, width, weights=None, labels=None, passed_inputs=None, **layer_params):
-        #print(f"{inputs_l=},{labels=},{dt=},{tau_inhibitory=},{tau_refractory=},{tau_leak=},{tau_ltp=},{thres=},{ainc=},{adec=},{wmax=},{wmin=}")
+    def ttron_layer(self, dendrite_connections, dendrite_weights=None, labels=None, **layer_params):
+        """
+        connections: описание каждого дендрита, список словарей. Каждый ключ - индекс входа из input_list, значение - задержка сигнала в дельтах
+        """
         for param in layer_params.keys():
             if param in layer_params:
                 self.layer_params[param].append(layer_params[param])
@@ -391,58 +393,107 @@ class SpikeNetworkSim:
         for dparam in self.defaults.keys():
             if dparam not in layer_params:
                 self.layer_params[dparam].append(self.defaults[dparam])
-                
-                
+        
+        first_node = self.nodes.index.size-1
+        last_priority = self.nodes.priority.max()
+        ltp_priority = last_priority+2  
+        layer = self.layers.layer.max()+1
+        
+        if dendrite_weights is None:
+            dendrite_weights = [{k: np.random.randint(1, 256, len(c)) for k, c in connection.items()} for connection in dendrite_connections]
+        
+        delay_map = {}
+        delay_ltp_nodes = {}
+        
+        dendrite_inputs_map = []
+        weights_map = []
+        
         nnodes = []
         nweights = []
-        nlayers = []
-        priority = self.nodes["priority"].max()+1
-        layer = self.layers["layer"].max()+1
         
-        if layer == 0: #первый слой
-            inputs = np.array(self.nodes.query("priority==0").index.tolist())
-        else: #нужно пропустить потенцирующие ноды
-            inputs = np.array(self.nodes.query("priority==@priority-2").index.tolist())
-        if passed_inputs is not None:
-            inputs = np.concatenate((inputs, passed_inputs))
-        if weights is None or weights.shape[0]==0:
-            weights = np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width, inputs.shape[0]))
-        elif weights.shape[1] > inputs.shape[0] or weights.shape[0] > width:
-            raise Exception(f"Требуется массив (1...{width},{inputs.shape[0]}), получено {weights.shape}")
-        elif weights.shape[0] < width:
-            weights = np.concatenate((weights, np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width-weights.shape[0], inputs.shape[0]))))
+        for dendrite, dweights in zip(dendrite_connections, dendrite_weights):
+            current_priority = last_priority+1
+            dendrite_inputs = []
+            weights = []
+            for synaptic_via, delay in dendrite.items():
+                if not synaptic_via in delay_map:
+                    delay_map[synaptic_via] = {0: synaptic_via}
+                if not isinstance(delay, int):
+                    for _d in delay:
+                        dendrite_inputs.append((synaptic_via, _d))
+                    delay = max(delay)
+                else:
+                    dendrite_inputs.append((synaptic_via, delay))
+                if delay > 0 and delay not in delay_map[synaptic_via]:
+                    for d in np.arange(delay, 1, -1):
+                        nnodes.append(
+                            {
+                                "type": "buffer", 
+                                "listening": first_node+len(nnodes)+2, 
+                                "broadcasting": None,
+                                "priority": current_priority
+                            }
+                        )
+                        delay_map[synaptic_via][d] = first_node+len(nnodes)
+                        current_priority += 1
+                    nnodes.append(
+                        {
+                            "type": "buffer", 
+                            "listening": synaptic_via, 
+                            "broadcasting": None,
+                            "priority": current_priority
+                        }
+                    )
+                    delay_map[synaptic_via][1] = first_node+len(nnodes)
+            weights = np.array([dweights[s][d] for s,d in dendrite_inputs])
+            weights_map.append(weights)
+            dendrite_inputs = [delay_map[s][d] for s,d in dendrite_inputs]
+            dendrite_inputs_map.append(dendrite_inputs)
+        for inputs in dendrite_inputs_map: 
+            for i in inputs:
+                if i not in delay_ltp_nodes:
+                    nnodes.append(
+                        {
+                            "type": "ltp",
+                            "listening": i,
+                            "broadcasting": None,
+                            "priority": ltp_priority
+                        }
+                    )
+                    delay_ltp_nodes[i] = first_node+len(nnodes)
+                
+        presynaptic_range = np.arange(len(dendrite_connections))*(3)+first_node+len(nnodes)+1
+        postsynaptic_range = presynaptic_range+1
+        
+        for dendrite, inputs, w in zip(dendrite_connections, dendrite_inputs_map, weights_map):
+                
+            presynaptic_priority = ltp_priority+1
+            max_tracker_priority = presynaptic_priority+1            
+            postsynaptic_priority = presynaptic_priority+1
+            spike_timer_priority = postsynaptic_priority+1
+            potentiating_priority = spike_timer_priority+1
+
+            teacher_id = first_node+len(nnodes)+1
+            presynaptic_id = teacher_id+1
+            max_tracker_id = presynaptic_id+1
+            postsynaptic_id = max_tracker_id+1
+            spike_timer_id = postsynaptic_id+1
+            potentiating_id = spike_timer_id+1
             
-        node_id = self.nodes.index.size
-        presynaptic_id = node_id+inputs.shape[0]
-        postsynaptic_id = presynaptic_id+1
-        potentiating_id = postsynaptic_id+1
-        
-        layer_ltp_range = np.arange(node_id, node_id+inputs.shape[0])
-        layer_presynaptic_range = np.arange(width)*(5)+presynaptic_id
-        layer_postsynaptic_range = np.arange(width)*(5)+postsynaptic_id
-        layer_potentiating_range = np.arange(width)*(5)+potentiating_id
-        
-        for i in inputs:
             nnodes.append(
                 {
-                    "type": "ltp",
-                    "listening": i,
+                    "type": "teacher",
+                    "listening": None,
                     "broadcasting": None,
-                    "priority": priority
+                    "priority": ltp_priority
                 }
             )
-                
-        
-        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
-        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes)), nlabels)))
-        
-        for w in weights:
             nnodes.append(
                 {
-                    "type": "presynaptic",
-                    "listening": inputs,
-                    "broadcasting": postsynaptic_id,
-                    "priority": priority+1
+                    "type": "presynaptic", 
+                    "listening": inputs, 
+                    "broadcasting": postsynaptic_id, 
+                    "priority": presynaptic_priority
                 }
             )
             nweights.append(
@@ -457,7 +508,7 @@ class SpikeNetworkSim:
                     "type": "max_tracker",
                     "listening": presynaptic_id,
                     "broadcasting": None,
-                    "priority": priority+2
+                    "priority": max_tracker_priority
                 }
             )
             
@@ -465,8 +516,8 @@ class SpikeNetworkSim:
                 {
                     "type": "postsynaptic",
                     "listening": presynaptic_id,
-                    "broadcasting": layer_presynaptic_range[layer_presynaptic_range != presynaptic_id],
-                    "priority": priority+3
+                    "broadcasting": presynaptic_range[presynaptic_range != presynaptic_id],
+                    "priority": postsynaptic_priority
                 }
             )
             nnodes.append(
@@ -474,34 +525,29 @@ class SpikeNetworkSim:
                     "type": "ltp",
                     "listening": postsynaptic_id,
                     "broadcasting": None,
-                    "priority": priority+4
+                    "priority": spike_timer_priority
                 }
             )
             nnodes.append(
                 {
                     "type": "potentiating",
-                    "listening": layer_ltp_range,
+                    "listening": np.concatenate(([teacher_id, spike_timer_id, max_tracker_id], [delay_ltp_nodes[n] for n in inputs], )),
                     "broadcasting": presynaptic_id,
-                    "priority": priority+5
+                    "priority": potentiating_priority
                 }
             )
             
-            presynaptic_id += 4
-            postsynaptic_id += 4
-        for p in layer_potentiating_range:
+        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
+        if labels is not None:
+            nlabels[postsynaptic_range-first_node-1] = labels
             
-            nnodes.append(
-                {
-                    "type": "teacher",
-                    "listening": None,
-                    "broadcasting": None,
-                    "priority": priority
-                }
-            )
-        nlayers = [{"layer": layer} for _ in range(node_id, presynaptic_id)]
+        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes), dtype="object"), nlabels)))
+        nlayers = [{"layer": layer} for _ in range(self.nodes.index.size, potentiating_id+1)]
         self.nodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True)
         self.weights = pd.concat((self.weights, pd.DataFrame(nweights).set_index("node", drop=True)))
         self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
+        
+        return self.nodes.query("type=='teacher'").index.tolist()
     
     def ttron_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
         
@@ -533,14 +579,15 @@ class SpikeNetworkSim:
                 if n_val:
                     vals[listen] = 0
             case "potentiating":
-                postsynaptic_timer = vals[listen[0]]
-                teacher = vals[listen[1]]
+                teacher = vals[listen[0]]
+                postsynaptic_timer = vals[listen[1]]
                 max_tracker = vals[listen[2]]
+                ltp = vals[listen[3:]]
                 if teacher:
                     vals[listen[0]] = False #отключаем таймер ожидания импульса от учителя
-                    change_weights(cast, vals[listen], max_tracker, params["ainc"])
+                    change_weights(cast, ltp, max_tracker, params["ainc"])
                 if postsynaptic_timer > params["tau_ltp"]:
-                    change_weights(cast, vals[listen], max_tracker, params["adec"])
+                    change_weights(cast, ltp, max_tracker, params["adec"])
             
         return vals, status
     
