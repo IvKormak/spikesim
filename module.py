@@ -462,8 +462,8 @@ class SpikeNetworkSim:
                     )
                     delay_ltp_nodes[i] = first_node+len(nnodes)
                 
-        presynaptic_range = np.arange(len(dendrite_connections))*(3)+first_node+len(nnodes)+1
-        postsynaptic_range = presynaptic_range+1
+        presynaptic_range = np.arange(len(dendrite_connections))*(6)+first_node+len(nnodes)+1
+        postsynaptic_range = presynaptic_range+3
         
         for dendrite, inputs, w in zip(dendrite_connections, dendrite_inputs_map, weights_map):
                 
@@ -476,7 +476,8 @@ class SpikeNetworkSim:
             teacher_id = first_node+len(nnodes)+1
             presynaptic_id = teacher_id+1
             max_tracker_id = presynaptic_id+1
-            postsynaptic_id = max_tracker_id+1
+            max_tracker_timer_id = max_tracker_id+1
+            postsynaptic_id = max_tracker_timer_id+1
             spike_timer_id = postsynaptic_id+1
             potentiating_id = spike_timer_id+1
             
@@ -507,8 +508,16 @@ class SpikeNetworkSim:
                 {
                     "type": "max_tracker",
                     "listening": presynaptic_id,
-                    "broadcasting": None,
+                    "broadcasting": max_tracker_timer_id,
                     "priority": max_tracker_priority
+                }
+            )
+            nnodes.append(
+                {
+                    "type": "ltp",
+                    "listening":None,
+                    "broadcasting": None,
+                    "priority": max_tracker_priority+1
                 }
             )
             
@@ -516,7 +525,7 @@ class SpikeNetworkSim:
                 {
                     "type": "postsynaptic",
                     "listening": presynaptic_id,
-                    "broadcasting": presynaptic_range[presynaptic_range != presynaptic_id],
+                    "broadcasting": [],
                     "priority": postsynaptic_priority
                 }
             )
@@ -531,7 +540,7 @@ class SpikeNetworkSim:
             nnodes.append(
                 {
                     "type": "potentiating",
-                    "listening": np.concatenate(([teacher_id, spike_timer_id, max_tracker_id], [delay_ltp_nodes[n] for n in inputs], )),
+                    "listening": np.concatenate(([teacher_id, spike_timer_id, max_tracker_timer_id], [delay_ltp_nodes[n] for n in inputs], )),
                     "broadcasting": presynaptic_id,
                     "priority": potentiating_priority
                 }
@@ -554,22 +563,27 @@ class SpikeNetworkSim:
         def change_weights(target_node, delays, time_offset, by):
             #не учитывать слишком новые импульсы, пришедшие после пика пресинаптического потенциала
             contrib_coeff = np.nan_to_num(np.exp(-np.where(delays<time_offset, np.nan, delays-time_offset)/params["tau_ltp"]), nan=0) 
-            dw = status["weights"][target_node]*contrib_coeff*by
-            dw = np.where(dw>params["wmax"], params["wmax"], nw)
-            status["weights"][target_node] += np.where(dw<params["wmin"], params["wmin"], dw)
+            dw = contrib_coeff*by + status["weights"][target_node]
+            dw = np.where(dw>params["wmax"], params["wmax"], dw)
+            status["weights"][target_node] = np.where(dw<params["wmin"], params["wmin"], dw).astype(dtype=np.int32)
             
         n_val = vals[node]
         match node_type:
             case "ltp":
-                if n_val:
-                    if vals[listen]:
-                        n_val = 1
-                    else:
-                        n_val = vals_z[node]+1
+                if n_val is not None:
+                    n_val = vals_z[node]+1
+                    if listen:
+                        if vals[listen]:
+                            n_val = 1
+                        
             case "max_tracker":
-                if vals[listen] > n_val:
+                if vals[listen] > vals_z[node]:
                     n_val = vals[listen]
                     vals[cast] = 1
+                else:
+                    n_val = vals_z[node]
+                if vals[cast] is None:
+                    n_val = 0
             case "buffer":
                 n_val = vals_z[listen]
             case "presynaptic":
@@ -579,16 +593,19 @@ class SpikeNetworkSim:
                 if n_val:
                     vals[listen] = 0
             case "potentiating":
+                n_val = 0
                 teacher = vals[listen[0]]
                 postsynaptic_timer = vals[listen[1]]
-                max_tracker = vals[listen[2]]
+                max_tracker_timer = vals[listen[2]]
                 ltp = vals[listen[3:]]
                 if teacher:
-                    vals[listen[0]] = False #отключаем таймер ожидания импульса от учителя
-                    change_weights(cast, ltp, max_tracker, params["ainc"])
+                    vals[listen[1]] = None #отключаем таймер ожидания импульса от учителя
+                    change_weights(cast, ltp, max_tracker_timer, params["ainc"])
+                    n_val = params["ainc"]
                 if postsynaptic_timer > params["tau_ltp"]:
-                    change_weights(cast, ltp, max_tracker, params["adec"])
-            
+                    change_weights(cast, ltp, max_tracker_timer, params["adec"])
+                    n_val = params["adec"]
+        vals[node] = n_val    
         return vals, status
     
     def feed_raw(self, data_raw, out_csv=None):
