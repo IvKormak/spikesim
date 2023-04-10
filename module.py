@@ -22,12 +22,12 @@ class SpikeNetworkSim:
                 "type": "input",
                 "priority": 0,
                 "listening": None,
-                "broadcasting": None
+                "broadcasting": None,
+                "layer": -1
             } for _ in range(inputs_l)]
         
-        self.nodes = pd.DataFrame(data=input_nodes, columns=["type", "priority", "listening", "broadcasting"])
+        self.nodes = pd.DataFrame(data=input_nodes, columns=["type", "priority", "listening", "broadcasting", "layer"])
         self.weights = pd.DataFrame(columns=["weights", "inhibited"])
-        self.layers = pd.DataFrame(data=[{"layer":-1} for _ in np.arange(inputs_l)], columns=["layer"])
         self.dt = dt
         
         self.layer_params = {
@@ -65,10 +65,8 @@ class SpikeNetworkSim:
             "ttron": self.ttron_process
         }
         
-    def new_dendritic_layer(self, dendrite_connections, dendrite_weights=None, labels=None, **layer_params):
-        """
-        connections: описание каждого дендрита, список словарей. Каждый ключ - индекс входа из input_list, значение - задержка сигнала в дельтах
-        """
+    def new_layer(self, num_nodes, weights=None, passed_inputs=None, **layer_params):
+        
         for param in layer_params.keys():
             if param in layer_params:
                 self.layer_params[param].append(layer_params[param])
@@ -78,255 +76,276 @@ class SpikeNetworkSim:
             if dparam not in layer_params:
                 self.layer_params[dparam].append(self.defaults[dparam])
         
-        first_node = self.nodes.index.size-1
-        last_priority = self.nodes.priority.max()
-        ltp_priority = last_priority+2  
-        layer = self.layers.layer.max()+1
+        layer = self.nodes["layer"].max()+1
         
-        if dendrite_weights is None:
-            dendrite_weights = [{k: np.random.randint(1, 256, len(c)) for k, c in connection.items()} for connection in dendrite_connections]
-        
-        delay_map = {}
-        delay_ltp_nodes = {}
-        
-        dendrite_inputs_map = []
-        weights_map = []
-        
-        nnodes = []
-        nweights = []
-        
-        for dendrite, dweights in zip(dendrite_connections, dendrite_weights):
-            current_priority = last_priority+1
-            dendrite_inputs = []
-            weights = []
-            for synaptic_via, delay in dendrite.items():
-                if not synaptic_via in delay_map:
-                    delay_map[synaptic_via] = {0: synaptic_via}
-                if not isinstance(delay, int):
-                    for _d in delay:
-                        dendrite_inputs.append((synaptic_via, _d))
-                    delay = max(delay)
-                else:
-                    dendrite_inputs.append((synaptic_via, delay))
-                if delay > 0 and delay not in delay_map[synaptic_via]:
-                    for d in np.arange(delay, 1, -1):
-                        nnodes.append(
-                            {
-                                "type": "buffer", 
-                                "listening": first_node+len(nnodes)+2, 
-                                "broadcasting": None,
-                                "priority": current_priority
-                            }
-                        )
-                        delay_map[synaptic_via][d] = first_node+len(nnodes)
-                        current_priority += 1
-                    nnodes.append(
-                        {
-                            "type": "buffer", 
-                            "listening": synaptic_via, 
-                            "broadcasting": None,
-                            "priority": current_priority
-                        }
-                    )
-                    delay_map[synaptic_via][1] = first_node+len(nnodes)
-            weights = np.array([dweights[s][d] for s,d in dendrite_inputs])
-            weights_map.append(weights)
-            dendrite_inputs = [delay_map[s][d] for s,d in dendrite_inputs]
-            dendrite_inputs_map.append(dendrite_inputs)
-        for inputs in dendrite_inputs_map: 
-            for i in inputs:
-                if i not in delay_ltp_nodes:
-                    nnodes.append(
-                        {
-                            "type": "ltp",
-                            "listening": i,
-                            "broadcasting": None,
-                            "priority": ltp_priority
-                        }
-                    )
-                    delay_ltp_nodes[i] = first_node+len(nnodes)
-                
-        presynaptic_range = np.arange(len(dendrite_connections))*(3)+first_node+len(nnodes)+1
-        postsynaptic_range = presynaptic_range+1
-        
-        for dendrite, inputs, w in zip(dendrite_connections, dendrite_inputs_map, weights_map):
-                
-            presynaptic_priority = ltp_priority+1
-            postsynaptic_priority = presynaptic_priority+1
-            potentiating_priority = postsynaptic_priority+1
-
-            presynaptic_id = first_node+len(nnodes)+1
-            postsynaptic_id = presynaptic_id+1
-            potentiating_id = postsynaptic_id+1
-            
-            
-            nnodes.append(
-                {
-                    "type": "presynaptic", 
-                    "listening": inputs, 
-                    "broadcasting": postsynaptic_id, 
-                    "priority": presynaptic_priority
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "postsynaptic", 
-                    "listening": presynaptic_id, 
-                    "broadcasting": presynaptic_range[presynaptic_range != presynaptic_id], 
-                    "priority": postsynaptic_priority}
-            )
-            nweights.append(
-                {
-                    "node": presynaptic_id,
-                    "weights": w,
-                    "inhibited": -1
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "potentiating", 
-                    "listening": [delay_ltp_nodes[n] for n in inputs], 
-                    "broadcasting": presynaptic_id, 
-                    "priority": potentiating_priority}
-            )
-            
-        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
-        if labels is not None:
-            nlabels[postsynaptic_range-first_node-1] = labels
-            
-        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes), dtype="object"), nlabels)))
-        nlayers = [{"layer": layer} for _ in range(self.nodes.index.size, potentiating_id+1)]
-        self.nodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True)
-        self.weights = pd.concat((self.weights, pd.DataFrame(nweights).set_index("node", drop=True)))
-        self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
-                          
-        
-    def new_layer(self, width, weights=None, labels=None, passed_inputs=None, **layer_params):
-        #print(f"{inputs_l=},{labels=},{dt=},{tau_inhibitory=},{tau_refractory=},{tau_leak=},{tau_ltp=},{thres=},{ainc=},{adec=},{wmax=},{wmin=}")
-        for param in layer_params.keys():
-            if param in layer_params:
-                self.layer_params[param].append(layer_params[param])
-            else:
-                raise Exception(f"Parameter {param} doesn't exist")
-        for dparam in self.defaults.keys():
-            if dparam not in layer_params:
-                self.layer_params[dparam].append(self.defaults[dparam])
-                
-                
-        nnodes = []
-        nweights = []
-        nlayers = []
-        priority = self.nodes["priority"].max()+1
-        layer = self.layers["layer"].max()+1
+        net = self.nodes
         
         if layer == 0: #первый слой
-            inputs = np.array(self.nodes.query("priority==0").index.tolist())
-        else: #нужно пропустить потенцирующие ноды
-            inputs = np.array(self.nodes.query("priority==@priority-2").index.tolist())
+            input_nodes = self.nodes.loc[self.nodes['type'] == 'input', ['type', 'listening', 'broadcasting', 'priority']]
+            net = None
+        else:
+            output_nodes = self.nodes.loc[net['type'] == 'postsynaptic'].index.tolist()
+            num_inputs = len(output_nodes)
+            input_nodes = pd.DataFrame({
+                'type': 'buffer',
+                'listening': [[output_nodes[i]] for i in range(num_inputs)],
+                'broadcasting': [[] for _ in range(num_inputs)],
+                'priority': 0
+            }, index=np.arange(net.index.max()+1, net.index.max()+1+num_inputs))
+        
         if passed_inputs is not None:
-            inputs = np.concatenate((inputs, passed_inputs))
-        if weights is None or weights.shape[0]==0:
-            weights = np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width, inputs.shape[0]))
-        elif weights.shape[1] > inputs.shape[0] or weights.shape[0] > width:
-            raise Exception(f"Требуется массив (1...{width},{inputs.shape[0]}), получено {weights.shape}")
-        elif weights.shape[0] < width:
-            weights = np.concatenate((weights, np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], (width-weights.shape[0], inputs.shape[0]))))
-            
-        node_id = self.nodes.index.size
-        presynaptic_id = node_id+inputs.shape[0]
-        postsynaptic_id = node_id+inputs.shape[0]+1
+            input_nodes = pd.concat(input_nodes, passed_inputs)
+        num_inputs = input_nodes.index.size
+
+        # Создаем DataFrame для узлов ltp
+        ltp_nodes = pd.DataFrame({
+            'type': 'ltp',
+            'listening': [[] for _ in range(num_inputs)],
+            'broadcasting': [[] for _ in range(num_inputs)],
+            'priority': 1
+        }, index=np.arange(input_nodes.index.max()+1, input_nodes.index.max()+1+num_inputs))
+
+        # Соединяем узлы input с узлами ltp и presynaptic
+        for i in range(num_inputs):
+            input_nodes.iat[i, 2] = [ltp_nodes.index[i]]
+            ltp_nodes.iat[i, 1] = [input_nodes.index[i]]
+
+        df = pd.concat([input_nodes, ltp_nodes])
+
+        for i in range(num_nodes):
+            presynaptic_node_index = df.index.max() + 1
+            postsynaptic_node_index = presynaptic_node_index + 1
+            potentiating_node_index = postsynaptic_node_index + 1
+
+            nodes_data = {
+                'presynaptic': {
+                    'listening': [input_nodes.index.tolist()],
+                    'broadcasting': [postsynaptic_node_index], 
+                    'index': presynaptic_node_index,
+                    'priority': 2
+                },
+                'postsynaptic': {
+                    'listening': [presynaptic_node_index],
+                    'broadcasting': [], 
+                    'index': postsynaptic_node_index,
+                    'priority': 3
+                },
+                'potentiating': {
+                    'listening': [ltp_nodes.index.tolist()],
+                    'broadcasting': [presynaptic_node_index], 
+                    'index': potentiating_node_index,
+                    'priority': 4
+                }
+            }
+
+            # Создаем DataFrame для всех узлов
+            nodes = pd.DataFrame([
+                {
+                    'type': k,
+                    **v
+                } for k, v in nodes_data.items()
+            ])
+
+            nodes = nodes.set_index('index')
+
+            # Конкатенируем все DataFrame в один
+            df = pd.concat([df, nodes])
+
+        for i in range(num_inputs):
+            df.iat[num_inputs+i, 2] = df.loc[df['type'] == 'potentiating'].index.tolist()
         
-        layer_ltp_range = np.arange(node_id, node_id+inputs.shape[0])
-        layer_presynaptic_range = np.arange(width)*(3)+presynaptic_id
-        layer_postsynaptic_range = np.arange(width)*(3)+postsynaptic_id
+        presynaptic_range = df[df.type == 'presynaptic'].index.tolist()
+        for i in df[df.type == 'postsynaptic'].index:
+            df.iat[i-df.index.min(), 2] = [p for p in presynaptic_range if p != i-(postsynaptic_node_index-presynaptic_node_index)]
+        if weights is None:
+            weights = {n: np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], num_inputs) for n in df.loc[df['type'] == 'presynaptic']}
         
-        for i in inputs:
-            nnodes.append(
-                {
-                    "type": "ltp",
-                    "listening": i,
-                    "broadcasting": None,
-                    "priority": priority
-                }
-            )
-                
-        
-        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
-        if labels is not None:
-            nlabels[postsynaptic_rangefirst_node-1] = labels
-        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes)), nlabels)))
-        
-        for w in weights:
-            nnodes.append(
-                {
-                    "type": "presynaptic",
-                    "listening": inputs,
-                    "broadcasting": postsynaptic_id,
-                    "priority": priority+1
-                }
-            )
-            nweights.append(
-                {
-                    "node": presynaptic_id,
-                    "weights": w,
-                    "inhibited": -1
-                }
-            )
-            
-            nnodes.append(
-                {
-                    "type": "postsynaptic",
-                    "listening": presynaptic_id,
-                    "broadcasting": layer_presynaptic_range[layer_presynaptic_range != presynaptic_id],
-                    "priority": priority+2
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "potentiating",
-                    "listening": layer_ltp_range,
-                    "broadcasting": presynaptic_id,
-                    "priority": priority+3
-                }
-            )
-            
-            presynaptic_id += 3
-            postsynaptic_id += 3
-        nlayers = [{"layer": layer} for _ in range(node_id, presynaptic_id)]
-        self.nodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True)
-        self.weights = pd.concat((self.weights, pd.DataFrame(nweights).set_index("node", drop=True)))
-        self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
-    
-    def make_recurrent(self):
-        max_priority = self.nodes["priority"].max()
-        last_layer_output = np.array(self.nodes.query("priority==@max_priority-1").index.tolist())
-        first_layer_summators = np.array(self.nodes.query("priority==2").index.tolist())
-        nlayer = [{"layer": 0} for _ in last_layer_output]
-        nnodes = [
+        if isinstance(weights, np.ndarray):
+            weights = {n: w for n, w in zip(df.loc[df['type'] == 'presynaptic'].index.tolist(), weights)}
+        df['layer'] = layer
+        self.nodes = pd.concat((net, df))
+        self.weights = pd.concat((self.weights, pd.DataFrame([
             {
-                "type": "recurrent",
-                "listening": o,
-                "broadcasting": None,
-                "priority": max_priority+1
-            } for o in last_layer_output
-        ]
-        recurrent_presynaptic_indexes = np.arange(self.nodes.index.size, self.nodes.index.size+last_layer_output.shape[0])
-        nweights = self.weights.to_dict()
-        nnodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True).to_dict()
-        for s in first_layer_summators:
-            nweights["weights"][s] = np.concatenate((nweights["weights"][s], np.random.randint(self.wmin, self.wmax, last_layer_output.shape[0])))
-            nnodes["listening"][s] = np.concatenate((nnodes["listening"][s], recurrent_presynaptic_indexes))
-            nnodes["listening"][s+2] = np.concatenate((nnodes["listening"][s+2], recurrent_presynaptic_indexes))
-        self.nodes = pd.DataFrame(nnodes)
-        self.weights = pd.DataFrame(nweights)
-        self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
+                "index": n,
+                "weights": w,
+                "inhibited": -1
+            } for n, w in weights.items()
+        ]).set_index("index")))
+    
+    def ttron_layer(self, num_nodes, num_cat_inputs, weights=None, passed_inputs=None, delay_depth=0, genome=None, **layer_params):
+        
+        for param in layer_params.keys():
+            if param in layer_params:
+                self.layer_params[param].append(layer_params[param])
+            else:
+                raise Exception(f"Parameter {param} doesn't exist")
+        for dparam in self.defaults.keys():
+            if dparam not in layer_params:
+                self.layer_params[dparam].append(self.defaults[dparam])
+        
+        layer = self.nodes.layer.max()+1
+        
+        max_priority = self.nodes.priority.max()
+        
+        if layer == 0: #первый слой
+            input_nodes = self.nodes.loc[self.nodes['type'] == 'input', ['type', 'listening', 'broadcasting', 'priority']]
+            net = None
+        else:
+            output_nodes = self.nodes.loc[net['type'] == 'postsynaptic'].index.tolist()
+            num_inputs = len(output_nodes)
+            input_nodes = pd.DataFrame({
+                'type': 'buffer',
+                'listening': [[output_nodes[i]] for i in range(num_inputs)],
+                'broadcasting': [[] for _ in range(num_inputs)],
+                'priority': 0
+            }, index=np.arange(net.index.max()+1, net.index.max()+1+num_inputs))
+            net = self.nodes
+    
+        
+        if passed_inputs is not None:
+            input_nodes = pd.concat(input_nodes, passed_inputs)
+        num_inputs = input_nodes.index.size
+            
+                
+        delay_nodes = input_nodes.copy()
+        for i in range(delay_depth):
+            delay_nodes = pd.concat((delay_nodes, pd.DataFrame({
+                'type': 'buffer',
+                'listening': [[delay_nodes.index[-num_inputs+n]] for n in range(num_inputs)],
+                'broadcasting': [[] for _ in range(num_inputs)],
+                'priority': max_priority+delay_depth-i
+            }, index=np.arange(input_nodes.index.max()+1+num_inputs*i, input_nodes.index.max()+1+num_inputs*(i+1)))))
+                                    
+        presynaptic_input = pd.concat((input_nodes, delay_nodes.loc[delay_nodes.priority == 1]))
+        presynaptic_ltp = []
+        input_nodes = delay_nodes
+        num_inputs = input_nodes.index.size
+
+        # Создаем DataFrame для узлов ltp
+        ltp_nodes = pd.DataFrame({
+            'type': 'ltp',
+            'listening': [[] for _ in range(num_inputs)],
+            'broadcasting': [[] for _ in range(num_inputs)],
+            'priority': 1
+        }, index=np.arange(input_nodes.index.max()+1, input_nodes.index.max()+1+num_inputs))
+
+        # Соединяем узлы input с узлами ltp и presynaptic
+        for i in range(num_inputs):
+            input_nodes.iat[i, 2] = [ltp_nodes.index[i]]
+            ltp_nodes.iat[i, 1] = [input_nodes.index[i]]
+            if input_nodes.index[i] in presynaptic_input.index:
+                presynaptic_ltp.append(ltp_nodes.index[i])
+            
+        df = pd.concat([input_nodes, ltp_nodes])
+        # добавляем категориальные входы
+        cat_inputs = pd.DataFrame({
+            'type': 'input',
+            'listening': [[] for _ in range(num_cat_inputs)],
+            'broadcasting': [[] for _ in range(num_cat_inputs)],
+            'priority': 0
+        }, index=np.arange(df.index.max()+1, df.index.max()+1+num_cat_inputs))
+        
+        if genome is None:
+            genome = cat_inputs.index.tolist()
+            if num_cat_inputs < num_nodes:
+                genome = np.concatenate((genome, np.random.choice(genome, num_nodes-num_cat_inputs)))          
+
+        df = pd.concat([df, cat_inputs])
+        for i in range(num_nodes):
+            
+            teacher_node_index           = df.index.max() + 1
+            presynaptic_node_index       = df.index.max() + 2
+            max_tracker_node_index       = df.index.max() + 3
+            max_tracker_timer_node_index = df.index.max() + 4
+            postsynaptic_node_index      = df.index.max() + 5
+            spike_timer_node_index       = df.index.max() + 6
+            potentiating_node_index      = df.index.max() + 7
+
+            nodes_data = [
+                {
+                    'type': 'teacher',
+                    'listening': [genome[i]],
+                    'broadcasting': [potentiating_node_index], 
+                    'index': teacher_node_index,
+                    'priority': 1
+                },{
+                    'type': 'presynaptic',
+                    'listening': presynaptic_input.index.tolist(),
+                    'broadcasting': [postsynaptic_node_index], 
+                    'index': presynaptic_node_index,
+                    'priority': 2
+                },{
+                    'type': 'max_tracker',
+                    'listening': [presynaptic_node_index],
+                    'broadcasting': [max_tracker_timer_node_index], 
+                    'index': max_tracker_node_index,
+                    'priority': 4
+                },{
+                    'type': 'ltp',
+                    'listening': [max_tracker_node_index],
+                    'broadcasting': [potentiating_node_index], 
+                    'index': max_tracker_timer_node_index,
+                    'priority': 3
+                },{
+                    'type': 'postsynaptic',
+                    'listening': [presynaptic_node_index],
+                    'broadcasting': [], 
+                    'index': postsynaptic_node_index,
+                    'priority': 3
+                },{
+                    'type': 'ltp',
+                    'listening': [postsynaptic_node_index],
+                    'broadcasting': [potentiating_node_index], 
+                    'index': spike_timer_node_index,
+                    'priority': 4
+                },{
+                    'type': 'potentiating',
+                    'listening': np.concatenate(([teacher_node_index, spike_timer_node_index, max_tracker_timer_node_index, postsynaptic_node_index], presynaptic_ltp, )),
+                    'broadcasting': [presynaptic_node_index], 
+                    'index': potentiating_node_index,
+                    'priority': 5
+                }
+            ]
+
+            # Создаем DataFrame для всех узлов
+            nodes = pd.DataFrame(nodes_data)
+
+            nodes = nodes.set_index('index')
+
+            # Конкатенируем все DataFrame в один
+            df = pd.concat([df, nodes])
+
+        for i in range(num_inputs):
+            df.iat[num_inputs+i, 2] = df.loc[df['type'] == 'potentiating'].index.tolist()
+        
+        presynaptic_range = df[df.type == 'presynaptic'].index.tolist()
+        for i in df[df.type == 'postsynaptic'].index:
+            df.iat[i, 2] = [p for p in presynaptic_range if p != i-(postsynaptic_node_index-presynaptic_node_index)]
+            
+        df['layer'] = layer
+        
+        if weights is None:
+            weights = {n: np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], presynaptic_input.index.size).astype(np.float32) for n in df.loc[df['type'] == 'presynaptic'].index.tolist()}
+            
+        if isinstance(weights, np.ndarray):
+            weights = {n: w for n, w in zip(df.loc[df['type'] == 'presynaptic'].index.tolist(), weights)}
+        
+        self.nodes = pd.concat((net, df))
+        self.weights = pd.concat((self.weights, pd.DataFrame([
+            {
+                "index": n,
+                "weights": w,
+                "inhibited": -1
+            } for n, w in weights.items()
+        ]).set_index('index')))
+        
+        return cat_inputs.index.tolist(), genome
     
     def stepwise_generator(self, data):
         vals_z = np.zeros(data.shape[1])
-        nodes_sorted = self.nodes.sort_values("priority")
+        nodes_sorted = self.nodes.sort_values("priority").loc[:, ['type', 'listening', 'broadcasting', 'layer']]
         
-        netmap = nodes_sorted.join(self.layers)
-        net_it = list(zip(netmap.values, netmap.index))
+        net_it = list(zip(nodes_sorted.values, nodes_sorted.index))
         
         layer_params = self.layer_params
         
@@ -334,7 +353,7 @@ class SpikeNetworkSim:
         
         for t, vals in enumerate(data):
             layer = None
-            for (node_type, _, listen, cast, _layer), node in net_it:
+            for (node_type, listen, cast, _layer), node in net_it:
                 n_val = 0
                 if node_type == "input":
                     continue
@@ -343,7 +362,11 @@ class SpikeNetworkSim:
                     params = {k: layer_params[k][layer] for k in layer_params.keys()}
                     params["leak"] = np.exp(-self.dt/params["tau_leak"])
                     processor = self.processors[params["layer_type"]]
-                vals, status = processor(node_type, _, listen, cast, status, vals, vals_z, params, node, t)       
+                if len(cast) == 1:
+                    cast = cast[0]
+                if len(listen) == 1:
+                    listen = listen[0]
+                vals, status = processor(node_type, listen, cast, status, vals, vals_z, params, node, t)       
                         
             vals_z = vals
             yield dict(zip(self.nodes.index, vals))
@@ -351,9 +374,11 @@ class SpikeNetworkSim:
         old_weights.update(status)
         self.weights = pd.DataFrame(old_weights)
     
-    def process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
-        n_val = vals[node]
+    def process(self, node_type, listen, cast, status, vals, vals_z, params, node, t):
+        n_val = vals_z[node]
         match node_type:
+            case "buffer":
+                n_val = vals_z[listen]
             case "ltp":
                 if vals[listen]:
                     n_val = 1
@@ -364,14 +389,13 @@ class SpikeNetworkSim:
             case "presynaptic":
                 if status["inhibited"][node] < t:
                     n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
+                if params["wta"] and status["inhibited"][node] >= t:
+                    n_val = 0
             case "postsynaptic":
                 n_val = int(vals[listen]>params["thres"])
                 if n_val:
-                    vals[listen] = 0
                     status["inhibited"][listen] = t+params["tau_refractory"]
                     for b in cast:
-                        if params["wta"]:
-                            vals[b] = 0
                         status["inhibited"][b] = max(t+params["tau_inhibitory"], status["inhibited"][b]+params["tau_inhibitory"])
             case "potentiating":
                 if vals[node-1] and params["learning"]:
@@ -381,235 +405,72 @@ class SpikeNetworkSim:
         vals[node] = n_val
         return vals, status
     
-    def ttron_layer(self, dendrite_connections, dendrite_weights=None, labels=None, **layer_params):
-        """
-        connections: описание каждого дендрита, список словарей. Каждый ключ - индекс входа из input_list, значение - задержка сигнала в дельтах
-        """
-        for param in layer_params.keys():
-            if param in layer_params:
-                self.layer_params[param].append(layer_params[param])
-            else:
-                raise Exception(f"Parameter {param} doesn't exist")
-        for dparam in self.defaults.keys():
-            if dparam not in layer_params:
-                self.layer_params[dparam].append(self.defaults[dparam])
-        
-        first_node = self.nodes.index.size-1
-        last_priority = self.nodes.priority.max()
-        ltp_priority = last_priority+2  
-        layer = self.layers.layer.max()+1
-        
-        if dendrite_weights is None:
-            dendrite_weights = [{k: np.random.randint(1, 256, len(c)) for k, c in connection.items()} for connection in dendrite_connections]
-        
-        delay_map = {}
-        delay_ltp_nodes = {}
-        
-        dendrite_inputs_map = []
-        weights_map = []
-        
-        nnodes = []
-        nweights = []
-        
-        for dendrite, dweights in zip(dendrite_connections, dendrite_weights):
-            current_priority = last_priority+1
-            dendrite_inputs = []
-            weights = []
-            for synaptic_via, delay in dendrite.items():
-                if not synaptic_via in delay_map:
-                    delay_map[synaptic_via] = {0: synaptic_via}
-                if not isinstance(delay, int):
-                    for _d in delay:
-                        dendrite_inputs.append((synaptic_via, _d))
-                    delay = max(delay)
-                else:
-                    dendrite_inputs.append((synaptic_via, delay))
-                if delay > 0 and delay not in delay_map[synaptic_via]:
-                    for d in np.arange(delay, 1, -1):
-                        nnodes.append(
-                            {
-                                "type": "buffer", 
-                                "listening": first_node+len(nnodes)+2, 
-                                "broadcasting": None,
-                                "priority": current_priority
-                            }
-                        )
-                        delay_map[synaptic_via][d] = first_node+len(nnodes)
-                        current_priority += 1
-                    nnodes.append(
-                        {
-                            "type": "buffer", 
-                            "listening": synaptic_via, 
-                            "broadcasting": None,
-                            "priority": current_priority
-                        }
-                    )
-                    delay_map[synaptic_via][1] = first_node+len(nnodes)
-            weights = np.array([dweights[s][d] for s,d in dendrite_inputs])
-            weights_map.append(weights)
-            dendrite_inputs = [delay_map[s][d] for s,d in dendrite_inputs]
-            dendrite_inputs_map.append(dendrite_inputs)
-        for inputs in dendrite_inputs_map: 
-            for i in inputs:
-                if i not in delay_ltp_nodes:
-                    nnodes.append(
-                        {
-                            "type": "ltp",
-                            "listening": i,
-                            "broadcasting": None,
-                            "priority": ltp_priority
-                        }
-                    )
-                    delay_ltp_nodes[i] = first_node+len(nnodes)
-                
-        presynaptic_range = np.arange(len(dendrite_connections))*(6)+first_node+len(nnodes)+1
-        postsynaptic_range = presynaptic_range+3
-        
-        for dendrite, inputs, w in zip(dendrite_connections, dendrite_inputs_map, weights_map):
-                
-            presynaptic_priority = ltp_priority+1
-            max_tracker_priority = presynaptic_priority+1            
-            postsynaptic_priority = presynaptic_priority+1
-            spike_timer_priority = postsynaptic_priority+1
-            potentiating_priority = spike_timer_priority+1
-
-            teacher_id = first_node+len(nnodes)+1
-            presynaptic_id = teacher_id+1
-            max_tracker_id = presynaptic_id+1
-            max_tracker_timer_id = max_tracker_id+1
-            postsynaptic_id = max_tracker_timer_id+1
-            spike_timer_id = postsynaptic_id+1
-            potentiating_id = spike_timer_id+1
-            
-            nnodes.append(
-                {
-                    "type": "teacher",
-                    "listening": None,
-                    "broadcasting": None,
-                    "priority": ltp_priority
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "presynaptic", 
-                    "listening": inputs, 
-                    "broadcasting": postsynaptic_id, 
-                    "priority": presynaptic_priority
-                }
-            )
-            nweights.append(
-                {
-                    "node": presynaptic_id,
-                    "weights": w,
-                    "inhibited": -1
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "max_tracker",
-                    "listening": presynaptic_id,
-                    "broadcasting": max_tracker_timer_id,
-                    "priority": max_tracker_priority
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "ltp",
-                    "listening":None,
-                    "broadcasting": None,
-                    "priority": max_tracker_priority+1
-                }
-            )
-            
-            nnodes.append(
-                {
-                    "type": "postsynaptic",
-                    "listening": presynaptic_id,
-                    "broadcasting": [],
-                    "priority": postsynaptic_priority
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "ltp",
-                    "listening": postsynaptic_id,
-                    "broadcasting": None,
-                    "priority": spike_timer_priority
-                }
-            )
-            nnodes.append(
-                {
-                    "type": "potentiating",
-                    "listening": np.concatenate(([teacher_id, spike_timer_id, max_tracker_timer_id], [delay_ltp_nodes[n] for n in inputs], )),
-                    "broadcasting": presynaptic_id,
-                    "priority": potentiating_priority
-                }
-            )
-            
-        nlabels = np.arange(first_node+1, first_node+1+len(nnodes), dtype="object")
-        if labels is not None:
-            nlabels[postsynaptic_range-first_node-1] = labels
-            
-        self.labels_dict.update(dict(zip(np.arange(first_node+1, first_node+1+len(nnodes), dtype="object"), nlabels)))
-        nlayers = [{"layer": layer} for _ in range(self.nodes.index.size, potentiating_id+1)]
-        self.nodes = pd.concat((self.nodes, pd.DataFrame(nnodes))).reset_index(drop=True)
-        self.weights = pd.concat((self.weights, pd.DataFrame(nweights).set_index("node", drop=True)))
-        self.layers = pd.concat((self.layers, pd.DataFrame(nlayers))).reset_index(drop=True)
-        
-        return self.nodes.query("type=='teacher'").index.tolist()
-    
-    def ttron_process(self, node_type, _, listen, cast, status, vals, vals_z, params, node, t):
+    def ttron_process(self, node_type, listen, cast, status, vals, vals_z, params, node, t):
         
         def change_weights(target_node, delays, time_offset, by):
             #не учитывать слишком новые импульсы, пришедшие после пика пресинаптического потенциала
             contrib_coeff = np.nan_to_num(np.exp(-np.where(delays<time_offset, np.nan, delays-time_offset)/params["tau_ltp"]), nan=0) 
             dw = contrib_coeff*by + status["weights"][target_node]
             dw = np.where(dw>params["wmax"], params["wmax"], dw)
-            status["weights"][target_node] = np.where(dw<params["wmin"], params["wmin"], dw).astype(dtype=np.int32)
+            status["weights"][target_node] = np.where(dw<params["wmin"], params["wmin"], dw).astype(dtype=np.float32)
             
-        n_val = vals[node]
+        n_val = vals_z[node]
         match node_type:
+            case "teacher":
+                n_val = vals[node]
+                if listen is not None:
+                    n_val = vals[listen]
             case "ltp":
                 if n_val is not None:
                     n_val = vals_z[node]+1
-                    if listen:
+                    if listen is not None:
                         if vals[listen]:
                             n_val = 1
                         
             case "max_tracker":
-                if vals[listen] > vals_z[node]:
+                if n_val == 0:
+                    vals[cast] = 1                    
+                if vals[listen] > n_val:
                     n_val = vals[listen]
                     vals[cast] = 1
-                else:
-                    n_val = vals_z[node]
-                if vals[cast] is None:
-                    n_val = 0
             case "buffer":
                 n_val = vals_z[listen]
             case "presynaptic":
-                n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
+                if status["inhibited"][node] < t:
+                    n_val = (vals[listen]*status["weights"][node]).sum()+vals_z[node]*params["leak"]
+                if (params["wta"] and status["inhibited"][node] >= t) or status["inhibited"][node]-params["tau_refractory"] == t-1:
+                    n_val = 0
             case "postsynaptic":
                 n_val = int(vals[listen]>params["thres"])
                 if n_val:
                     vals[listen] = 0
+                    status["inhibited"][listen] = t+params["tau_refractory"]
+                    for b in cast:
+                        status["inhibited"][b] = max(t+params["tau_inhibitory"], status["inhibited"][b]+params["tau_inhibitory"])
             case "potentiating":
-                n_val = 0
-                teacher = vals[listen[0]]
-                postsynaptic_timer = vals[listen[1]]
-                max_tracker_timer = vals[listen[2]]
-                ltp = vals[listen[3:]]
-                if teacher:
-                    vals[listen[1]] = None #отключаем таймер ожидания импульса от учителя
-                    change_weights(cast, ltp, max_tracker_timer, params["ainc"])
-                    n_val = params["ainc"]
-                if postsynaptic_timer > params["tau_ltp"]:
-                    change_weights(cast, ltp, max_tracker_timer, params["adec"])
-                    n_val = params["adec"]
+                if params["learning"]:
+                    teacher = vals[listen[0]]
+                    postsynaptic_timer = vals[listen[1]]
+                    max_tracker_timer = vals[listen[2]]
+                    postsynaptic = vals[listen[3]]
+                    ltp = vals[listen[4:]]
+                    n_val = 0
+                    if teacher and not np.isnan(postsynaptic_timer):
+                        change_weights(cast, ltp, max_tracker_timer, params["ainc"])
+                        vals[listen[1]] = None #отключаем таймер ожидания импульса от учителя
+                        n_val = 1
+                        vals[listen[2]-1]=0
+                    if postsynaptic_timer > params["tau_ltp"]:
+                        change_weights(cast, ltp, max_tracker_timer, params["adec"])
+                        vals[listen[1]] = None #отключаем таймер ожидания импульса от учителя
+                        n_val = -1
+                        vals[listen[2]-1]=0
         vals[node] = n_val    
         return vals, status
     
     def feed_raw(self, data_raw, out_csv=None):
-        self.weights["inhibited"].values[:] = 0
+        self.weights["inhibited"].values[:] = -1
+        self.values = None
         data = pd.DataFrame(data_raw, columns=self.nodes.index).fillna(0).values
         s = self.stepwise_generator(data)
         out = [u for u in s]
@@ -622,20 +483,22 @@ class SpikeNetworkSim:
                     writer.writerow(row)
         return pd.DataFrame(out)        
     
-    def error(self, answers_vector, pos_weight=1, neg_weight=1):
-        if not isinstance(answers_vector, np.ndarray):
-            answers_vector = np.array(answers_vector)
+    def error(self, answer_nodes, pattern_sights, pos_weight=1, neg_weight=1):
+        if not isinstance(answer_nodes, np.ndarray):
+            answer_nodes = np.array(answer_nodes)
         output_nodes = self.nodes.query("type == 'postsynaptic'").index
         outputs = self.values.loc[:, output_nodes].values
-        categories = list(set(answers_vector))
         score = []
-        for category in categories:
-            answers_cat_pos = np.where(answers_vector == category, 1, 0)
-            answers_cat_neg = np.where(answers_vector != category, 1, 0)
-            sp = np.einsum("i,ij->j", answers_cat_pos, outputs)*pos_weight
-            sn = np.einsum("i,ij->j", answers_cat_neg, outputs)*neg_weight
-            score.append(((answers_cat_pos.sum()-sp)+sn/(len(categories)-1))/answers_cat_pos.sum())
-        return pd.DataFrame(score, columns=output_nodes, index=categories)
+        #catid = np.arange(answer_nodes.shape[0])
+        res = {o: {} for o in output_nodes}
+        for a in answer_nodes:
+            answers_cat_pos = self.values.loc[self.values[a]==1]
+            answers_cat_neg = self.values.loc[self.values[[x for x in answer_nodes if x != a]].any(axis=1)]
+            for o in output_nodes:
+                pos = answers_cat_pos[o].sum()
+                neg = answers_cat_neg[o].sum()
+                res[o][a] = (pattern_sights[a]-pos)/pattern_sights[a]+neg/((len(pattern_sights)-1)*pattern_sights[a])
+        return res
             
             
     
