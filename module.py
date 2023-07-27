@@ -158,7 +158,7 @@ class SpikeNetworkSim:
         for i in df[df.type == 'postsynaptic'].index:
             df.iat[i-df.index.min(), 2] = [p for p in presynaptic_range if p != i-(postsynaptic_node_index-presynaptic_node_index)]
         if weights is None:
-            weights = {n: np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], num_inputs) for n in df.loc[df['type'] == 'presynaptic']}
+            weights = {n: np.random.randint(self.layer_params["wmin"][-1], self.layer_params["wmax"][-1], num_inputs) for n in df.loc[df['type'] == 'presynaptic'].index.tolist()}
         
         if isinstance(weights, np.ndarray):
             weights = {n: w for n, w in zip(df.loc[df['type'] == 'presynaptic'].index.tolist(), weights)}
@@ -329,7 +329,6 @@ class SpikeNetworkSim:
             
         if isinstance(weights, np.ndarray):
             weights = {n: w for n, w in zip(df.loc[df['type'] == 'presynaptic'].index.tolist(), weights)}
-        
         self.nodes = pd.concat((net, df))
         self.weights = pd.concat((self.weights, pd.DataFrame([
             {
@@ -351,7 +350,8 @@ class SpikeNetworkSim:
         
         status = self.weights.to_dict()
         
-        for t, vals in enumerate(data):
+        for i, vals in enumerate(data):
+            t=i*self.dt
             layer = None
             for (node_type, listen, cast, _layer), node in net_it:
                 n_val = 0
@@ -375,6 +375,7 @@ class SpikeNetworkSim:
         self.weights = pd.DataFrame(old_weights)
     
     def process(self, node_type, listen, cast, status, vals, vals_z, params, node, t):
+        
         n_val = vals_z[node]
         match node_type:
             case "buffer":
